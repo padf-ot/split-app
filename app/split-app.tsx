@@ -1,14 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, CircleDollarSign, Download, Pencil, Plus, Trash2, UserPlus, Users, X } from "lucide-react";
+import { ArrowRight, Check, CircleDollarSign, Download, Pencil, Plus, Repeat2, Trash2, UserPlus, Users, X } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 
 type Friend = { id: string; name: string };
 type SplitMethod = "equal" | "shares" | "percentage" | "exact";
 type SplitLine = { friendId: string; friendName: string; amount: number };
 type Expense = { id: string; name: string; description: string; price: number; currency: string; date: string; payerId: string; payerName: string; method: SplitMethod; splits: SplitLine[]; splitInputs?: Record<string, number> };
-type Group = { id: string; name: string; friends: Friend[]; expenses: Expense[] };
-type AppData = { version: 1; groups: [Group, Group]; activeGroupId: string };
+type Group = { id: string; name: string; friends: Friend[]; expenses: Expense[]; primaryCurrency?: string; exchangeRates?: Record<string, string>; settleInPrimary?: boolean };
+type AppData = { version: 1; groups: Group[]; activeGroupId: string };
 type Draft = { name: string; description: string; price: string; currency: string; otherCurrency: string; date: string; payerId: string; method: SplitMethod; selected: string[]; values: Record<string, string> };
 type Balance = { id: string; name: string; amount: number; removed: boolean };
 type Settlement = { from: string; to: string; amount: number };
@@ -42,7 +43,8 @@ const draftFromExpense = (expense: Expense): Draft => {
   }
   return { name: expense.name, description: expense.description, price: String(expense.price / 100), currency: isKnownCurrency ? expense.currency : "Other", otherCurrency: isKnownCurrency ? "" : expense.currency, date: expense.date, payerId: expense.payerId, method: expense.method, selected: expense.splits.map((line) => line.friendId), values };
 };
-const initialData = (): AppData => { const a = uid(), b = uid(); return { version: 1, activeGroupId: a, groups: [{ id: a, name: "Weekend trip", friends: [], expenses: [] }, { id: b, name: "Household", friends: [], expenses: [] }] }; };
+const newGroup = (name: string): Group => ({ id: uid(), name, friends: [], expenses: [], primaryCurrency: "SGD", exchangeRates: {}, settleInPrimary: false });
+const initialData = (): AppData => { const first = newGroup("Weekend trip"), second = newGroup("Household"); return { version: 1, activeGroupId: first.id, groups: [first, second] }; };
 const money = (amount: number, currency: string) => `${symbols[currency] ?? `${currency} `}${(amount / 100).toLocaleString(undefined, { minimumFractionDigits: currency === "JPY" ? 0 : 2, maximumFractionDigits: currency === "JPY" ? 0 : 2 })}`;
 
 function calculateSplits(draft: Draft, friends: Friend[]) {
@@ -90,6 +92,26 @@ function getBalances(group: Group, currency: string): Balance[] {
   return [...names].map(([id, name]) => ({ id, name, amount: amounts.get(id) || 0, removed: !group.friends.some((f) => f.id === id) }));
 }
 
+function getConvertedBalances(group: Group, primaryCurrency: string, rates: Record<string, string>): Balance[] {
+  const names = new Map<string, string>();
+  group.friends.forEach((friend) => names.set(friend.id, friend.name));
+  group.expenses.forEach((expense) => {
+    names.set(expense.payerId, expense.payerName);
+    expense.splits.forEach((line) => names.set(line.friendId, line.friendName));
+  });
+  const amounts = new Map([...names.keys()].map((id) => [id, 0]));
+  group.expenses.forEach((expense) => {
+    const rate = expense.currency === primaryCurrency ? 1 : Number(rates[expense.currency]);
+    if (!Number.isFinite(rate) || rate <= 0) return;
+    const convertedTotal = Math.round(expense.price * rate);
+    const convertedSplits = expense.splits.map((line) => Math.round(line.amount * rate));
+    if (convertedSplits.length) convertedSplits[convertedSplits.length - 1] += convertedTotal - convertedSplits.reduce((sum, amount) => sum + amount, 0);
+    amounts.set(expense.payerId, (amounts.get(expense.payerId) || 0) + convertedTotal);
+    expense.splits.forEach((line, index) => amounts.set(line.friendId, (amounts.get(line.friendId) || 0) - convertedSplits[index]));
+  });
+  return [...names].map(([id, name]) => ({ id, name, amount: amounts.get(id) || 0, removed: !group.friends.some((friend) => friend.id === id) }));
+}
+
 function settle(balances: Balance[]): Settlement[] {
   const debtors = balances.filter((b) => b.amount < -1).map((b) => ({ ...b, left: -b.amount })).sort((a, b) => b.left - a.left);
   const creditors = balances.filter((b) => b.amount > 1).map((b) => ({ ...b, left: b.amount })).sort((a, b) => b.left - a.left);
@@ -121,6 +143,11 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
   const currency = draft.currency === "Other" ? draft.otherCurrency.trim().toUpperCase() : draft.currency;
   const split = calculateSplits(draft, formFriends);
   const currenciesInUse = [...new Set(group.expenses.map((e) => e.currency))];
+  const primaryCurrency = group.primaryCurrency ?? "SGD";
+  const exchangeRates = group.exchangeRates ?? {};
+  const conversionCurrencies = currenciesInUse.filter((code) => code !== primaryCurrency);
+  const conversionReady = conversionCurrencies.every((code) => Number(exchangeRates[code]) > 0);
+  const primaryCurrencyOptions = [...new Set([...currencies.filter((code) => code !== "Other"), ...currenciesInUse])];
 
   useEffect(() => {
     let cancelled = false;
@@ -152,8 +179,21 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
   }, [data, ready, canSync]);
 
-  const updateGroup = (fn: (g: Group) => Group) => setData((old) => ({ ...old, groups: old.groups.map((g) => g.id === old.activeGroupId ? fn(g) : g) as [Group, Group] }));
+  const updateGroup = (fn: (g: Group) => Group) => setData((old) => ({ ...old, groups: old.groups.map((g) => g.id === old.activeGroupId ? fn(g) : g) }));
   const updateDraft = (patch: Partial<Draft>) => setDrafts((old) => ({ ...old, [group.id]: { ...draft, ...patch } }));
+  function addGroup() {
+    const next = newGroup(`Group ${data.groups.length + 1}`);
+    setData((old) => ({ ...old, groups: [...old.groups, next], activeGroupId: next.id }));
+    setFriendName(""); setFriendError(""); setEditingExpenseId(null); setShowForm(false);
+  }
+  function removeGroup() {
+    if (data.groups.length <= 1 || !window.confirm(`Delete “${group.name}” and all its expenses?`)) return;
+    setData((old) => {
+      const groups = old.groups.filter((item) => item.id !== old.activeGroupId);
+      return { ...old, groups, activeGroupId: groups[0].id };
+    });
+    setFriendName(""); setFriendError(""); setEditingExpenseId(null); setShowForm(false);
+  }
   function addFriend() {
     const name = friendName.trim(); if (!name) return;
     if (group.friends.some((f) => f.name.toLocaleLowerCase() === name.toLocaleLowerCase())) { setFriendError("That name is already in this group."); return; }
@@ -191,12 +231,12 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
   function exportPdf() {
     setExporting(true);
     const totals = currenciesInUse.map((c) => ({ c, total: group.expenses.filter((e) => e.currency === c).reduce((s, e) => s + e.price, 0) }));
-    const sections = totals.map(({ c, total }) => {
-      const balances = getBalances(group, c), payments = settle(balances);
-      return `<section><h2>${escapeHtml(c)} · ${escapeHtml(money(total, c))} spent</h2><h3>Balances</h3>${balances.map((b) => `<div class="row"><span>${escapeHtml(b.name)}${b.removed ? " (removed)" : ""}</span><strong class="${b.amount > 0 ? "pos" : b.amount < 0 ? "neg" : ""}">${b.amount > 0 ? "is owed " : b.amount < 0 ? "owes " : "settled up"}${b.amount ? escapeHtml(money(Math.abs(b.amount), c)) : ""}</strong></div>`).join("")}<h3>Settle up</h3>${payments.length ? payments.map((s) => `<div class="payment"><b>${escapeHtml(s.from)}</b> pays <b>${escapeHtml(s.to)}</b><strong>${escapeHtml(money(s.amount, c))}</strong></div>`).join("") : "<p>Everyone is settled up.</p>"}</section>`;
-    }).join("");
+    const useConversion = Boolean(group.settleInPrimary && conversionReady);
+    const sections = useConversion
+      ? `<section><h2>Settle up · ${escapeHtml(primaryCurrency)}</h2><p class="note">Converted using your manual rates: ${conversionCurrencies.map((code) => `1 ${escapeHtml(code)} = ${escapeHtml(exchangeRates[code])} ${escapeHtml(primaryCurrency)}`).join(" · ") || "No conversion needed"}</p>${settle(getConvertedBalances(group, primaryCurrency, exchangeRates)).map((s) => `<div class="payment"><b>${escapeHtml(s.from)}</b> pays <b>${escapeHtml(s.to)}</b><strong>${escapeHtml(money(s.amount, primaryCurrency))}</strong></div>`).join("") || "<p>Everyone is settled up.</p>"}</section>`
+      : totals.map(({ c, total }) => { const payments = settle(getBalances(group, c)); return `<section><h2>Settle up · ${escapeHtml(c)}</h2><p class="note">${escapeHtml(money(total, c))} spent</p>${payments.length ? payments.map((s) => `<div class="payment"><b>${escapeHtml(s.from)}</b> pays <b>${escapeHtml(s.to)}</b><strong>${escapeHtml(money(s.amount, c))}</strong></div>`).join("") : "<p>Everyone is settled up.</p>"}</section>`; }).join("");
     const expenses = [...group.expenses].sort((a, b) => a.date.localeCompare(b.date)).map((e) => `<tr><td>${escapeHtml(e.date)}</td><td><b>${escapeHtml(e.name)}</b>${e.description ? `<small>${escapeHtml(e.description)}</small>` : ""}</td><td>${escapeHtml(e.payerName)}</td><td>${escapeHtml(money(e.price, e.currency))}</td></tr>`).join("");
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(group.name)} — Split</title><style>${reportCss}</style></head><body><header><div class="brand">SPLIT / REPORT</div><h1>${escapeHtml(group.name)}</h1><p>Generated ${escapeHtml(new Date().toLocaleString())}</p></header><main><section><h2>Total spent</h2><div class="totals">${totals.map((t) => `<div><span>${escapeHtml(t.c)}</span><strong>${escapeHtml(money(t.total, t.c))}</strong></div>`).join("")}</div></section>${sections}<section class="log"><h2>Expense log</h2><table><thead><tr><th>Date</th><th>Expense</th><th>Paid by</th><th>Amount</th></tr></thead><tbody>${expenses}</tbody></table></section></main></body></html>`;
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(group.name)} — Split</title><style>${reportCss}</style></head><body><header><div class="brand">SPLIT / REPORT</div><h1>${escapeHtml(group.name)}</h1><p>Generated ${escapeHtml(new Date().toLocaleString())}</p></header><main>${sections}<section><h2>Total spent</h2><div class="totals">${totals.map((t) => `<div><span>${escapeHtml(t.c)}</span><strong>${escapeHtml(money(t.total, t.c))}</strong></div>`).join("")}</div></section><section class="log"><h2>Expense log</h2><table><thead><tr><th>Date</th><th>Expense</th><th>Paid by</th><th>Amount</th></tr></thead><tbody>${expenses}</tbody></table></section></main></body></html>`;
     const win = window.open("", "_blank");
     if (!win) { setExporting(false); return; }
     win.document.write(html); win.document.close();
@@ -210,13 +250,13 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
       <div className="flex items-center gap-3"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span><button onClick={exportPdf} disabled={exporting || !group.expenses.length} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
-      <div className="mb-5 flex gap-1 overflow-x-auto rounded-xl bg-[#e9edf3] p-1">{data.groups.map((g) => <button key={g.id} onClick={() => { setData((d) => ({ ...d, activeGroupId: g.id })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }} className={`min-w-0 flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition ${g.id === group.id ? "bg-white text-[#1769e0] shadow-sm" : "text-[#667085] hover:text-[#344054]"}`}>{g.name}</button>)}</div>
-      <section className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div className="min-w-0"><label className="eyebrow">Group name</label><input aria-label="Group name" value={group.name} onChange={(e) => updateGroup((g) => ({ ...g, name: e.target.value }))} className="group-name"/><p className="mt-1 text-sm text-[#667085]">{group.friends.length} {group.friends.length === 1 ? "friend" : "friends"} · {group.expenses.length} {group.expenses.length === 1 ? "expense" : "expenses"}</p></div><button onClick={openAddExpense} disabled={group.friends.length < 2} className="primary-button self-start sm:self-auto"><Plus size={18}/>Add expense</button></section>
+      <div className="group-tabs-shell"><div className="group-tabs">{data.groups.map((g) => <button key={g.id} onClick={() => { setData((d) => ({ ...d, activeGroupId: g.id })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }} className={`group-tab ${g.id === group.id ? "active" : ""}`}>{g.name}</button>)}</div><button onClick={addGroup} className="add-group-button" aria-label="Add group"><Plus size={17}/><span>New group</span></button></div>
+      <section className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div className="min-w-0"><label className="eyebrow">Group name</label><input aria-label="Group name" value={group.name} onChange={(e) => updateGroup((g) => ({ ...g, name: e.target.value }))} className="group-name"/><p className="mt-1 text-sm text-[#667085]">{group.friends.length} {group.friends.length === 1 ? "friend" : "friends"} · {group.expenses.length} {group.expenses.length === 1 ? "expense" : "expenses"}</p></div><div className="flex items-center gap-2">{data.groups.length > 1 && <button onClick={removeGroup} className="secondary-button danger-button" aria-label={`Delete ${group.name}`}><Trash2 size={16}/>Delete group</button>}<button onClick={openAddExpense} disabled={group.friends.length < 2} className="primary-button"><Plus size={18}/>Add expense</button></div></section>
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1.45fr)_minmax(320px,.75fr)] lg:items-start"><div className="space-y-5">
-        {currenciesInUse.length ? <>
-          <section className="surface"><div className="section-heading"><div><span className="eyebrow">At a glance</span><h2>Balances</h2></div></div><div className="divide-y divide-[#edf0f4]">{currenciesInUse.map((c) => <div key={c} className="py-5 first:pt-1 last:pb-1"><div className="mb-3 flex items-baseline justify-between"><h3 className="font-bold">{c}</h3><span className="text-sm text-[#667085]">{money(group.expenses.filter((e) => e.currency === c).reduce((s,e) => s + e.price,0), c)} spent</span></div><div className="grid gap-2 sm:grid-cols-2">{getBalances(group,c).map((b) => <div key={b.id} className="flex items-center justify-between rounded-xl bg-[#f7f8fa] px-3.5 py-3"><span className="truncate text-sm font-medium">{b.name}{b.removed && <small className="ml-1 text-[#98a2b3]">removed</small>}</span><span className={`ml-3 whitespace-nowrap text-sm font-bold ${b.amount > 0 ? "text-[#178250]" : b.amount < 0 ? "text-[#cf3f3f]" : "text-[#667085]"}`}>{b.amount > 0 ? "+" : b.amount < 0 ? "−" : ""}{money(Math.abs(b.amount),c)}</span></div>)}</div></div>)}</div></section>
-          <section className="surface"><div className="section-heading"><div><span className="eyebrow">Minimum payments</span><h2>Settle up</h2></div></div><div className="space-y-5">{currenciesInUse.map((c) => { const payments=settle(getBalances(group,c)); return <div key={c}><h3 className="mb-2 text-xs font-bold uppercase tracking-[.1em] text-[#667085]">{c}</h3>{payments.length ? <div className="space-y-2">{payments.map((p,i) => <div key={i} className="settlement"><span className="font-semibold">{p.from}</span><ArrowRight size={15} className="text-[#98a2b3]"/><span className="font-semibold">{p.to}</span><strong>{money(p.amount,c)}</strong></div>)}</div> : <div className="empty-line"><Check size={16}/>Everyone is settled up</div>}</div>})}</div></section>
-        </> : <section className="empty-state"><div className="empty-icon"><CircleDollarSign size={25}/></div><h2>No expenses yet</h2><p>Add at least two friends, then log your first shared expense.</p>{group.friends.length >= 2 && <button onClick={openAddExpense} className="primary-button mt-5"><Plus size={18}/>Add expense</button>}</section>}
+        {currenciesInUse.length ? <section className="surface settle-surface"><div className="section-heading"><div><span className="eyebrow">Minimum payments</span><h2>Settle up</h2></div>{group.settleInPrimary && conversionReady && <span className="conversion-badge">Converted to {primaryCurrency}</span>}</div>
+          <div className="space-y-5">{group.settleInPrimary ? conversionReady ? (() => { const payments = settle(getConvertedBalances(group, primaryCurrency, exchangeRates)); return <div><h3 className="mb-2 text-xs font-bold uppercase tracking-[.1em] text-[#667085]">{primaryCurrency} · all expenses</h3>{payments.length ? <div className="space-y-2">{payments.map((payment,index) => <div key={index} className="settlement"><span className="font-semibold">{payment.from}</span><ArrowRight size={15} className="text-[#98a2b3]"/><span className="font-semibold">{payment.to}</span><strong>{money(payment.amount,primaryCurrency)}</strong></div>)}</div> : <div className="empty-line"><Check size={16}/>Everyone is settled up</div>}</div>; })() : <div className="conversion-warning">Enter every required rate below to calculate the converted settlement.</div> : currenciesInUse.map((code) => { const payments=settle(getBalances(group,code)); return <div key={code}><div className="mb-2 flex items-baseline justify-between gap-4"><h3 className="text-xs font-bold uppercase tracking-[.1em] text-[#667085]">{code}</h3><span className="text-xs text-[#98a2b3]">{money(group.expenses.filter((expense)=>expense.currency===code).reduce((sum,expense)=>sum+expense.price,0),code)} spent</span></div>{payments.length ? <div className="space-y-2">{payments.map((payment,index) => <div key={index} className="settlement"><span className="font-semibold">{payment.from}</span><ArrowRight size={15} className="text-[#98a2b3]"/><span className="font-semibold">{payment.to}</span><strong>{money(payment.amount,code)}</strong></div>)}</div> : <div className="empty-line"><Check size={16}/>Everyone is settled up</div>}</div>})}</div>
+          <div className="conversion-panel"><div className="conversion-head"><div className="flex items-center gap-2.5"><span className="conversion-icon"><Repeat2 size={17}/></span><div><h3>Convert currencies</h3><p>Use one settlement currency without changing the original expenses.</p></div></div><Switch className="data-[state=checked]:bg-[#1769e0]" aria-label="Settle in primary currency" checked={Boolean(group.settleInPrimary)} onCheckedChange={(checked) => updateGroup((current) => ({ ...current, settleInPrimary: checked }))}/></div><div className="conversion-controls"><label className="field"><span>Primary currency</span><select className="input" value={primaryCurrency} onChange={(event) => updateGroup((current) => ({ ...current, primaryCurrency: event.target.value }))}>{primaryCurrencyOptions.map((code)=><option key={code} value={code}>{code}</option>)}</select></label>{conversionCurrencies.map((code)=><label className="rate-field" key={code}><span>1 {code}</span><span>=</span><input className="input" type="number" inputMode="decimal" min="0" step="any" placeholder="Rate" value={exchangeRates[code] ?? ""} onChange={(event) => updateGroup((current) => ({ ...current, exchangeRates: { ...(current.exchangeRates ?? {}), [code]: event.target.value } }))}/><span>{primaryCurrency}</span></label>)}</div>{!conversionCurrencies.length && <p className="conversion-note">All expenses already use {primaryCurrency}; no rate is needed.</p>}<p className="conversion-note">Rates are manual and apply to every expense in that currency.</p></div>
+        </section> : <section className="empty-state"><div className="empty-icon"><CircleDollarSign size={25}/></div><h2>No expenses yet</h2><p>Add at least two friends, then log your first shared expense.</p>{group.friends.length >= 2 && <button onClick={openAddExpense} className="primary-button mt-5"><Plus size={18}/>Add expense</button>}</section>}
         <section className="surface"><div className="section-heading"><div><span className="eyebrow">History</span><h2>Expenses</h2></div><span className="count-pill">{group.expenses.length}</span></div>{group.expenses.length ? <div className="space-y-1">{group.expenses.map((e) => <article key={e.id} className="expense-row"><div className="date-box"><b>{new Date(`${e.date}T00:00:00`).toLocaleDateString(undefined,{day:"2-digit"})}</b><span>{new Date(`${e.date}T00:00:00`).toLocaleDateString(undefined,{month:"short"})}</span></div><div className="min-w-0 flex-1"><h3 className="truncate font-semibold">{e.name}</h3><p className="truncate text-sm text-[#667085]">Paid by {e.payerName}{e.description ? ` · ${e.description}` : ""}</p></div><div className="text-right"><strong className="block whitespace-nowrap">{money(e.price,e.currency)}</strong><span className="text-xs text-[#667085]">{methods.find((m)=>m.key===e.method)?.label}</span></div><div className="expense-actions"><button aria-label={`Edit ${e.name}`} onClick={() => openEditExpense(e)} className="icon-button"><Pencil size={15}/></button><button aria-label={`Remove ${e.name}`} onClick={() => updateGroup((g) => ({ ...g, expenses: g.expenses.filter((x) => x.id !== e.id) }))} className="icon-button"><Trash2 size={16}/></button></div></article>)}</div> : <p className="py-8 text-center text-sm text-[#98a2b3]">Your expense log will appear here.</p>}</section>
       </div>
       <aside className="surface lg:sticky lg:top-24"><div className="section-heading"><div><span className="eyebrow">This group</span><h2>Friends</h2></div><Users size={19} className="text-[#667085]"/></div><form onSubmit={(e) => { e.preventDefault(); addFriend(); }} className="flex gap-2"><input value={friendName} onChange={(e) => { setFriendName(e.target.value); setFriendError(""); }} placeholder="Add a name" aria-label="Friend name" className="input flex-1"/><button className="square-button" aria-label="Add friend"><UserPlus size={18}/></button></form>{friendError && <p className="mt-2 text-xs font-medium text-[#cf3f3f]">{friendError}</p>}<div className="mt-4 space-y-1">{group.friends.map((f) => <div key={f.id} className="friend-row"><span className="avatar">{f.name.slice(0,1).toLocaleUpperCase()}</span><span className="min-w-0 flex-1 truncate font-medium">{f.name}</span><button onClick={() => removeFriend(f.id)} aria-label={`Remove ${f.name}`} className="icon-button"><X size={15}/></button></div>)}</div>{!group.friends.length && <p className="mt-5 text-sm leading-6 text-[#667085]">Start with everyone who may pay or share an expense.</p>}</aside>

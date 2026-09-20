@@ -1,8 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, CircleDollarSign, Download, Pencil, Plus, Trash2, UserPlus, Users, X } from "lucide-react";
+import { ArrowRight, Check, CircleDollarSign, Download, LogIn, LogOut, Pencil, Plus, Trash2, UserPlus, Users, X } from "lucide-react";
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from "firebase/auth";
+import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { auth, db } from "@/lib/firebase";
 
 type Friend = { id: string; name: string };
 type SplitMethod = "equal" | "shares" | "percentage" | "exact";
@@ -95,6 +98,7 @@ const draftFromExpense = (expense: Expense): Draft => {
 };
 const newGroup = (name: string): Group => ({ id: uid(), name, friends: [], expenses: [], primaryCurrency: "SGD", exchangeRates: {}, settleInPrimary: false });
 const initialData = (): AppData => { const first = newGroup("Weekend trip"), second = newGroup("Household"); return { version: 1, activeGroupId: first.id, groups: [first, second] }; };
+const isAppData = (value: unknown): value is AppData => Boolean(value && typeof value === "object" && (value as AppData).version === 1 && Array.isArray((value as AppData).groups) && (value as AppData).groups.length && typeof (value as AppData).activeGroupId === "string");
 const money = (amount: number, currency: string) => {
   const digits = precision(currency) === 0 && amount % 100 === 0 ? 0 : 2;
   return `${symbols[currency] ?? `${currency} `}${(amount / 100).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
@@ -178,10 +182,12 @@ function settle(balances: Balance[]): Settlement[] {
   return result;
 }
 
-export default function SplitApp({ canSync }: { canSync: boolean }) {
+export default function SplitApp() {
   const [data, setData] = useState<AppData>(() => initialData());
   const [ready, setReady] = useState(false);
-  const [sync, setSync] = useState<"saving" | "synced" | "local">(canSync ? "saving" : "local");
+  const [authReady, setAuthReady] = useState(false);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [sync, setSync] = useState<"saving" | "synced" | "local">("local");
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [friendName, setFriendName] = useState("");
   const [friendError, setFriendError] = useState("");
@@ -213,33 +219,48 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.resolve().then(async () => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => { void (async () => {
+      if (cancelled) return;
+      setReady(false);
+      setFirebaseUser(user);
+      let next: AppData | null = null;
       const local = localStorage.getItem("split-app-data");
-      if (local && !cancelled) try { setData(JSON.parse(local)); } catch {}
-      if (canSync) {
+      if (local) try { const parsed: unknown = JSON.parse(local); if (isAppData(parsed)) next = parsed; } catch {}
+      if (user) {
         try {
-          const response = await fetch("/api/state");
-          if (!response.ok) throw new Error();
-          const remote = await response.json() as { data?: AppData };
-          if (!cancelled && remote.data) setData(remote.data);
+          const snapshot = await getDoc(doc(db,"users",user.uid));
+          const remote = snapshot.data()?.state as unknown;
+          if (isAppData(remote)) next = remote;
           if (!cancelled) setSync("synced");
         } catch { if (!cancelled) setSync("local"); }
-      }
-      if (!cancelled) setReady(true);
-    });
-    return () => { cancelled = true; };
-  }, [canSync]);
+      } else if (!cancelled) setSync("local");
+      if (!cancelled && next) setData(next);
+      if (!cancelled) { setReady(true); setAuthReady(true); }
+    })(); });
+    return () => { cancelled = true; unsubscribe(); };
+  }, []);
 
   useEffect(() => {
     if (!ready) return;
     localStorage.setItem("split-app-data", JSON.stringify(data));
-    if (!canSync) return;
+    if (!firebaseUser) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => { setSync("saving"); void fetch("/api/state", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ data }) })
-      .then((r) => { if (!r.ok) throw new Error(); setSync("synced"); }).catch(() => setSync("local"));
+    saveTimer.current = setTimeout(() => {
+      setSync("saving");
+      void setDoc(doc(db,"users",firebaseUser.uid), { state:data, updatedAt:serverTimestamp() })
+        .then(() => setSync("synced"))
+        .catch(() => setSync("local"));
     }, 550);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [data, ready, canSync]);
+  }, [data, ready, firebaseUser]);
+
+  async function signIn() {
+    try {
+      await signInWithPopup(auth,new GoogleAuthProvider());
+    } catch (error) {
+      if ((error as { code?: string }).code !== "auth/popup-closed-by-user") window.alert("Google sign-in could not be completed. Please try again.");
+    }
+  }
 
   const updateGroup = (fn: (g: Group) => Group) => setData((old) => ({ ...old, groups: old.groups.map((g) => g.id === old.activeGroupId ? fn(g) : g) }));
   const updateDraft = (patch: Partial<Draft>) => setDrafts((old) => ({ ...old, [group.id]: { ...draft, ...patch } }));
@@ -310,7 +331,7 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
   return <main className="min-h-screen bg-[#f7f8fa] text-[#172033]">
     <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
       <div className="flex items-center gap-2.5"><img src="/split-icon-v2.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
-      <div className="flex items-center gap-3"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span><button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
+      <div className="flex items-center gap-2"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span>{authReady && (firebaseUser ? <button onClick={() => void signOut(auth)} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
       <div className="group-tabs-shell"><div className="group-tabs">{data.groups.map((g) => <button key={g.id} onClick={() => { setData((d) => ({ ...d, activeGroupId: g.id })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }} className={`group-tab ${g.id === group.id ? "active" : ""}`}>{g.name}</button>)}</div><button onClick={addGroup} className="add-group-button" aria-label="Add group"><Plus size={17}/><span>New group</span></button></div>

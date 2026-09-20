@@ -91,7 +91,7 @@ for(let k=0;k<1000;k++) {
  clears(a.getConvertedBalances(g,'SGD',{MYR:'0.315457413249'}));
 }
 assert(!source.includes('Minimum payments'));
-assert(source.includes('Split with:') && source.includes('<th>Split with</th>'));
+assert(!source.includes('Split with:') && source.includes('ExpenseSplitTooltip') && source.includes('<th>Split with</th>'));
 assert(source.includes('escapeHtml(line.friendName)'));
 let report='';
 const reportWindow={
@@ -119,7 +119,7 @@ const reportContext=vm.createContext({
  setTimeout:fn=>fn(),
  window:{open:()=>reportWindow}
 });
-vm.runInContext(ts.transpile(source.slice(source.indexOf('function escapeHtml')), {target:ts.ScriptTarget.ES2022}),reportContext);
+vm.runInContext(ts.transpile(source.slice(source.indexOf('function escapeHtml'),source.indexOf('function ExpenseSplitTooltip')), {target:ts.ScriptTarget.ES2022}),reportContext);
 const exportCode=source.slice(source.indexOf('  function exportPdf()'),source.indexOf('  const canSave'));
 vm.runInContext(ts.transpile(exportCode,{target:ts.ScriptTarget.ES2022})+';exportPdf();',reportContext);
 assert(report.includes('Split with'));

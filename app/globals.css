@@ -46,6 +46,10 @@ button:disabled { cursor:not-allowed; opacity:.45; }
 .settlement strong { color:#1769e0; white-space:nowrap; }
 .empty-line { display:flex; align-items:center; gap:.5rem; border-radius:.75rem; background:#eff8f3; padding:.8rem; color:#178250; font-size:.875rem; font-weight:650; }
 .conversion-badge { border-radius:99px; background:#edf4fd; padding:.35rem .65rem; color:#1769e0; font-size:.72rem; font-weight:800; }
+.settlement-tabs { width:100%; height:auto !important; min-height:2.75rem; background:#e9edf3; color:#667085; }
+.settlement-tabs [role=tab] { min-height:2.4rem; white-space:normal; color:#667085; }
+.settlement-tabs [role=tab][data-state=active] { background:white; color:#1769e0; font-weight:700; }
+.settlement-tabs [role=tab]:focus-visible { outline:2px solid #1769e0; outline-offset:2px; }
 .conversion-warning { border:1px solid #f3d3a4; border-radius:.75rem; background:#fff9ed; padding:.8rem; color:#8a5700; font-size:.85rem; font-weight:650; }
 .conversion-panel { margin-top:1.35rem; border-top:1px solid #edf0f4; padding-top:1.25rem; }
 .conversion-head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }

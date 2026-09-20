@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1789873046649,
+      "tag": "0000_fantastic_enchantress",
+      "breakpoints": true
+    }
+  ]
+}

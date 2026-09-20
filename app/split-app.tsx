@@ -246,7 +246,7 @@ export default function SplitApp({ canSync }: { canSync: boolean }) {
   const canSave = formFriends.length >= 2 && Boolean(draft.name.trim()) && Number(draft.price) > 0 && Boolean(currency) && Boolean(draft.payerId) && split.valid;
   return <main className="min-h-screen bg-[#f7f8fa] text-[#172033]">
     <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
-      <div className="flex items-center gap-2.5"><span className="grid h-9 w-9 place-items-center rounded-xl bg-[#1769e0] text-white"><CircleDollarSign size={20}/></span><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
+      <div className="flex items-center gap-2.5"><img src="/split-icon.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
       <div className="flex items-center gap-3"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span><button onClick={exportPdf} disabled={exporting || !group.expenses.length} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">

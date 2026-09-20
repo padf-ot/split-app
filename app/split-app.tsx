@@ -223,27 +223,27 @@ export default function SplitApp() {
       if (cancelled) return;
       setReady(false);
       setFirebaseUser(user);
-      let next: AppData | null = null;
-      const local = localStorage.getItem("split-app-data");
-      if (local) try { const parsed: unknown = JSON.parse(local); if (isAppData(parsed)) next = parsed; } catch {}
-      if (user) {
-        try {
-          const snapshot = await getDoc(doc(db,"users",user.uid));
-          const remote = snapshot.data()?.state as unknown;
-          if (isAppData(remote)) next = remote;
-          if (!cancelled) setSync("synced");
-        } catch { if (!cancelled) setSync("local"); }
-      } else if (!cancelled) setSync("local");
-      if (!cancelled && next) setData(next);
+      if (!user) {
+        localStorage.removeItem("split-app-data");
+        setData(initialData());
+        setSync("local");
+        setReady(true);
+        setAuthReady(true);
+        return;
+      }
+      try {
+        const snapshot = await getDoc(doc(db,"users",user.uid));
+        const remote = snapshot.data()?.state as unknown;
+        if (!cancelled) setData(isAppData(remote) ? remote : initialData());
+        if (!cancelled) setSync("synced");
+      } catch { if (!cancelled) setSync("local"); }
       if (!cancelled) { setReady(true); setAuthReady(true); }
     })(); });
     return () => { cancelled = true; unsubscribe(); };
   }, []);
 
   useEffect(() => {
-    if (!ready) return;
-    localStorage.setItem("split-app-data", JSON.stringify(data));
-    if (!firebaseUser) return;
+    if (!ready || !firebaseUser) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       setSync("saving");
@@ -261,6 +261,9 @@ export default function SplitApp() {
       if ((error as { code?: string }).code !== "auth/popup-closed-by-user") window.alert("Google sign-in could not be completed. Please try again.");
     }
   }
+
+  if (!authReady || (firebaseUser && !ready)) return <main className="auth-page"><div className="auth-card auth-loading"><img src="/split-icon-v2.svg" alt="" width={56} height={56}/><p>Loading Split…</p></div></main>;
+  if (!firebaseUser) return <main className="auth-page"><section className="auth-card"><img src="/split-icon-v2.svg" alt="" width={68} height={68}/><span className="eyebrow">Shared expenses, simplified</span><h1>Welcome to Split</h1><p>Keep your groups, expenses and settlements securely synced across your devices.</p><button onClick={() => void signIn()} className="google-sign-in"><LogIn size={18}/>Continue with Google</button><small>Your records stay private to your signed-in account.</small></section></main>;
 
   const updateGroup = (fn: (g: Group) => Group) => setData((old) => ({ ...old, groups: old.groups.map((g) => g.id === old.activeGroupId ? fn(g) : g) }));
   const updateDraft = (patch: Partial<Draft>) => setDrafts((old) => ({ ...old, [group.id]: { ...draft, ...patch } }));
@@ -334,7 +337,7 @@ export default function SplitApp() {
       <div className="flex items-center gap-2"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span>{authReady && (firebaseUser ? <button onClick={() => void signOut(auth)} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
-      <div className="group-tabs-shell"><div className="group-tabs">{data.groups.map((g) => <button key={g.id} onClick={() => { setData((d) => ({ ...d, activeGroupId: g.id })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }} className={`group-tab ${g.id === group.id ? "active" : ""}`}>{g.name}</button>)}</div><button onClick={addGroup} className="add-group-button" aria-label="Add group"><Plus size={17}/><span>New group</span></button></div>
+      <div className="group-switcher"><label><span className="eyebrow">Current group</span><select aria-label="Current group" value={group.id} onChange={(event) => { setData((current) => ({ ...current, activeGroupId:event.target.value })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }}>{data.groups.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><button onClick={addGroup} className="add-group-button" aria-label="Create a new group"><Plus size={17}/><span>New group</span></button></div>
       <section className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div className="min-w-0"><label className="eyebrow">Group name</label><input aria-label="Group name" value={group.name} onChange={(e) => updateGroup((g) => ({ ...g, name: e.target.value }))} className="group-name"/><p className="mt-1 text-sm text-[#667085]">{group.friends.length} {group.friends.length === 1 ? "friend" : "friends"} · {group.expenses.length} {group.expenses.length === 1 ? "expense" : "expenses"}</p></div><div className="flex items-center gap-2">{data.groups.length > 1 && <button onClick={removeGroup} className="secondary-button danger-button" aria-label={`Delete ${group.name}`}><Trash2 size={16}/>Delete group</button>}<button onClick={openAddExpense} disabled={group.friends.length < 2} className="primary-button"><Plus size={18}/>Add expense</button></div></section>
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1.45fr)_minmax(320px,.75fr)] lg:items-start"><div className="space-y-5">
         {currenciesInUse.length ? <section className="surface settle-surface"><div className="section-heading"><div><span className="eyebrow">Suggested payments</span><h2>Settle up</h2></div>{group.settleInPrimary && conversionReady && <span className="conversion-badge">Converted to {primaryCurrency}</span>}</div>

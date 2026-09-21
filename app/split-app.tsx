@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ArrowRight, Check, CircleDollarSign, Download, LogIn, LogOut, Pencil, Plus, Trash2, UserPlus, Users, X } from "lucide-react";
-import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from "firebase/auth";
+import { browserLocalPersistence, GoogleAuthProvider, onAuthStateChanged, setPersistence, signInWithPopup, signOut, type User as FirebaseUser } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { auth, db } from "@/lib/firebase";
@@ -187,7 +187,8 @@ export default function SplitApp() {
   const [ready, setReady] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
-  const [sync, setSync] = useState<"saving" | "synced" | "local">("local");
+  const [sync, setSync] = useState<"saving" | "synced" | "delayed" | "offline" | "error">("saving");
+  const [saveRetry, setSaveRetry] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [friendName, setFriendName] = useState("");
   const [friendError, setFriendError] = useState("");
@@ -195,6 +196,8 @@ export default function SplitApp() {
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const slowSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveSequence = useRef(0);
   const group = data.groups.find((g) => g.id === data.activeGroupId) ?? data.groups[0];
   const draft = drafts[group.id] ?? blankDraft();
   const editingExpense = group.expenses.find((expense) => expense.id === editingExpenseId);
@@ -219,43 +222,73 @@ export default function SplitApp() {
 
   useEffect(() => {
     let cancelled = false;
-    const unsubscribe = onAuthStateChanged(auth, (user) => { void (async () => {
-      if (cancelled) return;
-      setReady(false);
-      setFirebaseUser(user);
-      if (!user) {
-        localStorage.removeItem("split-app-data");
-        setData(initialData());
-        setSync("local");
-        setReady(true);
-        setAuthReady(true);
-        return;
-      }
-      try {
-        const snapshot = await getDoc(doc(db,"users",user.uid));
-        const remote = snapshot.data()?.state as unknown;
-        if (!cancelled) setData(isAppData(remote) ? remote : initialData());
-        if (!cancelled) setSync("synced");
-      } catch { if (!cancelled) setSync("local"); }
-      if (!cancelled) { setReady(true); setAuthReady(true); }
-    })(); });
+    let unsubscribe = () => {};
+
+    void setPersistence(auth, browserLocalPersistence)
+      .catch(() => undefined)
+      .then(() => {
+        if (cancelled) return;
+        unsubscribe = onAuthStateChanged(auth, (user) => { void (async () => {
+          if (cancelled) return;
+          setReady(false);
+          setFirebaseUser(user);
+          if (!user) {
+            localStorage.removeItem("split-app-data");
+            setData(initialData());
+            setSync("saving");
+            setReady(true);
+            setAuthReady(true);
+            return;
+          }
+          try {
+            const snapshot = await getDoc(doc(db,"users",user.uid));
+            const remote = snapshot.data()?.state as unknown;
+            if (!cancelled) setData(isAppData(remote) ? remote : initialData());
+            if (!cancelled) setSync(snapshot.metadata.fromCache ? (navigator.onLine ? "delayed" : "offline") : "synced");
+          } catch { if (!cancelled) setSync(navigator.onLine ? "error" : "offline"); }
+          if (!cancelled) { setReady(true); setAuthReady(true); }
+        })(); });
+      });
+
     return () => { cancelled = true; unsubscribe(); };
   }, []);
 
   useEffect(() => {
     if (!ready || !firebaseUser) return;
+    const sequence = ++saveSequence.current;
     if (saveTimer.current) clearTimeout(saveTimer.current);
+    if (slowSaveTimer.current) clearTimeout(slowSaveTimer.current);
     saveTimer.current = setTimeout(() => {
       setSync("saving");
+      const slowTimer = setTimeout(() => {
+        if (sequence === saveSequence.current) setSync(navigator.onLine ? "delayed" : "offline");
+      }, 8000);
+      slowSaveTimer.current = slowTimer;
       void setDoc(doc(db,"users",firebaseUser.uid), { state:data, updatedAt:serverTimestamp() })
-        .then(() => setSync("synced"))
-        .catch(() => setSync("local"));
+        .then(() => { if (sequence === saveSequence.current) setSync("synced"); })
+        .catch(() => { if (sequence === saveSequence.current) setSync(navigator.onLine ? "error" : "offline"); })
+        .finally(() => clearTimeout(slowTimer));
     }, 550);
-    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [data, ready, firebaseUser]);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      if (slowSaveTimer.current) clearTimeout(slowSaveTimer.current);
+    };
+  }, [data, ready, firebaseUser, saveRetry]);
+
+  useEffect(() => {
+    const handleOnline = () => setSaveRetry((value) => value + 1);
+    const handleOffline = () => setSync("offline");
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   async function signIn() {
     try {
+      await setPersistence(auth,browserLocalPersistence);
       await signInWithPopup(auth,new GoogleAuthProvider());
     } catch (error) {
       if ((error as { code?: string }).code !== "auth/popup-closed-by-user") window.alert("Google sign-in could not be completed. Please try again.");
@@ -331,10 +364,15 @@ export default function SplitApp() {
   }
 
   const canSave = formFriends.length >= 1 && Boolean(draft.name.trim()) && Number(draft.price) > 0 && Boolean(currency) && Boolean(draft.payerId) && split.valid;
+  const syncLabel = sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : sync === "delayed" ? "Sync delayed · Tap to retry" : sync === "offline" ? "Offline · Will retry" : "Save failed · Tap to retry";
+  const syncClass = sync === "synced" ? "text-[#178250]" : sync === "saving" ? "text-[#1769e0]" : "text-[#b54708]";
+  const syncDot = sync === "synced" ? "bg-[#16a05d]" : sync === "saving" ? "animate-pulse bg-[#1769e0]" : "bg-[#f79009]";
+  const canRetrySync = sync === "delayed" || sync === "error";
   return <main className="min-h-screen bg-[#f7f8fa] text-[#172033]">
-    <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
-      <div className="flex items-center gap-2.5"><img src="/split-icon-v2.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
-      <div className="flex items-center gap-2"><span className={`hidden items-center gap-1.5 text-xs font-medium sm:flex ${sync === "local" ? "text-[#667085]" : "text-[#178250]"}`}><span className={`h-2 w-2 rounded-full ${sync === "saving" ? "animate-pulse bg-[#1769e0]" : sync === "synced" ? "bg-[#16a05d]" : "bg-[#98a2b3]"}`}/>{sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : "Local only"}</span>{authReady && (firebaseUser ? <button onClick={() => void signOut(auth)} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
+    <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between px-4 py-3 sm:flex-nowrap sm:px-6">
+      <div className="order-1 flex items-center gap-2.5"><img src="/split-icon-v2.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
+      {canRetrySync ? <button type="button" onClick={() => setSaveRetry((value) => value + 1)} className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</button> : <span className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</span>}
+      <div className="order-2 flex items-center gap-2 sm:order-3 sm:ml-2">{authReady && (firebaseUser ? <button onClick={() => void signOut(auth)} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
       <div className="group-switcher"><label><span className="eyebrow">Current group</span><select aria-label="Current group" value={group.id} onChange={(event) => { setData((current) => ({ ...current, activeGroupId:event.target.value })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }}>{data.groups.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><button onClick={addGroup} className="add-group-button" aria-label="Create a new group"><Plus size={17}/><span>New group</span></button></div>

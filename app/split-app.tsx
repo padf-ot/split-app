@@ -99,6 +99,16 @@ const draftFromExpense = (expense: Expense): Draft => {
 const newGroup = (name: string): Group => ({ id: uid(), name, friends: [], expenses: [], primaryCurrency: "SGD", exchangeRates: {}, settleInPrimary: false });
 const initialData = (): AppData => { const first = newGroup("Weekend trip"), second = newGroup("Household"); return { version: 1, activeGroupId: first.id, groups: [first, second] }; };
 const isAppData = (value: unknown): value is AppData => Boolean(value && typeof value === "object" && (value as AppData).version === 1 && Array.isArray((value as AppData).groups) && (value as AppData).groups.length && typeof (value as AppData).activeGroupId === "string");
+const backupKey = (userId: string) => `split-app-data:${userId}`;
+function readBackup(userId: string): { state: AppData; savedAt: number; pending: boolean } | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(backupKey(userId)) ?? "null") as { state?: unknown; savedAt?: unknown; pending?: unknown } | null;
+    return parsed && isAppData(parsed.state) && typeof parsed.savedAt === "number" && Number.isFinite(parsed.savedAt) ? { state:parsed.state, savedAt:parsed.savedAt, pending:parsed.pending === true } : null;
+  } catch { return null; }
+}
+function writeBackup(userId: string, state: AppData, savedAt: number, pending: boolean): boolean {
+  try { localStorage.setItem(backupKey(userId), JSON.stringify({ state, savedAt, pending })); return true; } catch { return false; }
+}
 const money = (amount: number, currency: string) => {
   const digits = precision(currency) === 0 && amount % 100 === 0 ? 0 : 2;
   return `${symbols[currency] ?? `${currency} `}${(amount / 100).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
@@ -198,6 +208,7 @@ export default function SplitApp() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const slowSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveSequence = useRef(0);
+  const localBackupAvailable = useRef(false);
   const group = data.groups.find((g) => g.id === data.activeGroupId) ?? data.groups[0];
   const draft = drafts[group.id] ?? blankDraft();
   const editingExpense = group.expenses.find((expense) => expense.id === editingExpenseId);
@@ -240,12 +251,17 @@ export default function SplitApp() {
             setAuthReady(true);
             return;
           }
+          const backup = readBackup(user.uid);
           try {
             const snapshot = await getDoc(doc(db,"users",user.uid));
             const remote = snapshot.data()?.state as unknown;
-            if (!cancelled) setData(isAppData(remote) ? remote : initialData());
+            const next = backup?.pending ? backup.state : isAppData(remote) ? remote : backup?.state ?? initialData();
+            if (!cancelled) setData(next);
             if (!cancelled) setSync(snapshot.metadata.fromCache ? (navigator.onLine ? "delayed" : "offline") : "synced");
-          } catch { if (!cancelled) setSync(navigator.onLine ? "error" : "offline"); }
+          } catch {
+            if (!cancelled && backup) setData(backup.state);
+            if (!cancelled) setSync(backup ? (navigator.onLine ? "delayed" : "offline") : "error");
+          }
           if (!cancelled) { setReady(true); setAuthReady(true); }
         })(); });
       });
@@ -256,16 +272,18 @@ export default function SplitApp() {
   useEffect(() => {
     if (!ready || !firebaseUser) return;
     const sequence = ++saveSequence.current;
+    const clientUpdatedAt = Date.now();
+    localBackupAvailable.current = writeBackup(firebaseUser.uid, data, clientUpdatedAt, true);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     if (slowSaveTimer.current) clearTimeout(slowSaveTimer.current);
     saveTimer.current = setTimeout(() => {
       setSync("saving");
       const slowTimer = setTimeout(() => {
-        if (sequence === saveSequence.current) setSync(navigator.onLine ? "delayed" : "offline");
+        if (sequence === saveSequence.current) setSync(localBackupAvailable.current ? (navigator.onLine ? "delayed" : "offline") : "error");
       }, 8000);
       slowSaveTimer.current = slowTimer;
-      void setDoc(doc(db,"users",firebaseUser.uid), { state:data, updatedAt:serverTimestamp() })
-        .then(() => { if (sequence === saveSequence.current) setSync("synced"); })
+      void setDoc(doc(db,"users",firebaseUser.uid), { state:data, clientUpdatedAt, updatedAt:serverTimestamp() })
+        .then(() => { if (sequence === saveSequence.current) { writeBackup(firebaseUser.uid, data, clientUpdatedAt, false); setSync("synced"); } })
         .catch(() => { if (sequence === saveSequence.current) setSync(navigator.onLine ? "error" : "offline"); })
         .finally(() => clearTimeout(slowTimer));
     }, 550);
@@ -277,7 +295,7 @@ export default function SplitApp() {
 
   useEffect(() => {
     const handleOnline = () => setSaveRetry((value) => value + 1);
-    const handleOffline = () => setSync("offline");
+    const handleOffline = () => setSync(localBackupAvailable.current ? "offline" : "error");
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
     return () => {
@@ -293,6 +311,11 @@ export default function SplitApp() {
     } catch (error) {
       if ((error as { code?: string }).code !== "auth/popup-closed-by-user") window.alert("Google sign-in could not be completed. Please try again.");
     }
+  }
+
+  async function signOutAndClear() {
+    if (firebaseUser) localStorage.removeItem(backupKey(firebaseUser.uid));
+    await signOut(auth);
   }
 
   if (!authReady || (firebaseUser && !ready)) return <main className="auth-page"><div className="auth-card auth-loading"><img src="/split-icon-v2.svg" alt="" width={56} height={56}/><p>Loading Split…</p></div></main>;
@@ -364,7 +387,7 @@ export default function SplitApp() {
   }
 
   const canSave = formFriends.length >= 1 && Boolean(draft.name.trim()) && Number(draft.price) > 0 && Boolean(currency) && Boolean(draft.payerId) && split.valid;
-  const syncLabel = sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : sync === "delayed" ? "Sync delayed · Tap to retry" : sync === "offline" ? "Offline · Will retry" : "Save failed · Tap to retry";
+  const syncLabel = sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : sync === "delayed" ? "Saved on device · Tap to retry sync" : sync === "offline" ? "Saved on device · Will sync online" : "Save failed · Tap to retry";
   const syncClass = sync === "synced" ? "text-[#178250]" : sync === "saving" ? "text-[#1769e0]" : "text-[#b54708]";
   const syncDot = sync === "synced" ? "bg-[#16a05d]" : sync === "saving" ? "animate-pulse bg-[#1769e0]" : "bg-[#f79009]";
   const canRetrySync = sync === "delayed" || sync === "error";
@@ -372,7 +395,7 @@ export default function SplitApp() {
     <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between px-4 py-3 sm:flex-nowrap sm:px-6">
       <div className="order-1 flex items-center gap-2.5"><img src="/split-icon-v2.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
       {canRetrySync ? <button type="button" onClick={() => setSaveRetry((value) => value + 1)} className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</button> : <span className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</span>}
-      <div className="order-2 flex items-center gap-2 sm:order-3 sm:ml-2">{authReady && (firebaseUser ? <button onClick={() => void signOut(auth)} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
+      <div className="order-2 flex items-center gap-2 sm:order-3 sm:ml-2">{authReady && (firebaseUser ? <button onClick={() => void signOutAndClear()} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
       <div className="group-switcher"><label><span className="eyebrow">Current group</span><select aria-label="Current group" value={group.id} onChange={(event) => { setData((current) => ({ ...current, activeGroupId:event.target.value })); setFriendError(""); setEditingExpenseId(null); setShowForm(false); }}>{data.groups.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><button onClick={addGroup} className="add-group-button" aria-label="Create a new group"><Plus size={17}/><span>New group</span></button></div>

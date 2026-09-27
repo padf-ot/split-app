@@ -109,6 +109,13 @@ function readBackup(userId: string): { state: AppData; savedAt: number; pending:
 function writeBackup(userId: string, state: AppData, savedAt: number, pending: boolean): boolean {
   try { localStorage.setItem(backupKey(userId), JSON.stringify({ state, savedAt, pending })); return true; } catch { return false; }
 }
+function syncFailure(error: unknown): string {
+  const code = (error as { code?: string })?.code;
+  if (code === "permission-denied") return "Firebase access denied · Check Firestore rules";
+  if (code === "failed-precondition" || code === "not-found") return "Firestore unavailable · Check database setup";
+  if (code === "unauthenticated") return "Firebase session expired · Sign in again";
+  return navigator.onLine ? "Cloud sync failed · Tap to retry" : "Saved on device · Will sync online";
+}
 const money = (amount: number, currency: string) => {
   const digits = precision(currency) === 0 && amount % 100 === 0 ? 0 : 2;
   return `${symbols[currency] ?? `${currency} `}${(amount / 100).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
@@ -198,6 +205,9 @@ export default function SplitApp() {
   const [authReady, setAuthReady] = useState(false);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [sync, setSync] = useState<"saving" | "synced" | "delayed" | "offline" | "error">("saving");
+  const [syncError, setSyncError] = useState("");
+  const [loadError, setLoadError] = useState(false);
+  const [loadRetry, setLoadRetry] = useState(0);
   const [saveRetry, setSaveRetry] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [friendName, setFriendName] = useState("");
@@ -209,6 +219,7 @@ export default function SplitApp() {
   const slowSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveSequence = useRef(0);
   const localBackupAvailable = useRef(false);
+  const skipHydrationSave = useRef(false);
   const group = data.groups.find((g) => g.id === data.activeGroupId) ?? data.groups[0];
   const draft = drafts[group.id] ?? blankDraft();
   const editingExpense = group.expenses.find((expense) => expense.id === editingExpenseId);
@@ -242,6 +253,7 @@ export default function SplitApp() {
         unsubscribe = onAuthStateChanged(auth, (user) => { void (async () => {
           if (cancelled) return;
           setReady(false);
+          setLoadError(false);
           setFirebaseUser(user);
           if (!user) {
             localStorage.removeItem("split-app-data");
@@ -252,25 +264,37 @@ export default function SplitApp() {
             return;
           }
           const backup = readBackup(user.uid);
+          let canOpen = true;
           try {
             const snapshot = await getDoc(doc(db,"users",user.uid));
             const remote = snapshot.data()?.state as unknown;
+            if (snapshot.metadata.fromCache && !isAppData(remote) && !backup) throw new Error("No cached data");
             const next = backup?.pending ? backup.state : isAppData(remote) ? remote : backup?.state ?? initialData();
+            skipHydrationSave.current = !backup?.pending && (isAppData(remote) || snapshot.metadata.fromCache);
             if (!cancelled) setData(next);
             if (!cancelled) setSync(snapshot.metadata.fromCache ? (navigator.onLine ? "delayed" : "offline") : "synced");
-          } catch {
-            if (!cancelled && backup) setData(backup.state);
-            if (!cancelled) setSync(backup ? (navigator.onLine ? "delayed" : "offline") : "error");
+          } catch (error) {
+            if (!cancelled && backup) {
+              skipHydrationSave.current = !backup.pending;
+              setData(backup.state);
+              setSync(navigator.onLine ? "error" : "offline");
+              setSyncError(syncFailure(error));
+            } else if (!cancelled) {
+              canOpen = false;
+              setLoadError(true);
+              setSyncError(syncFailure(error));
+            }
           }
-          if (!cancelled) { setReady(true); setAuthReady(true); }
+          if (!cancelled) { setReady(canOpen); setAuthReady(true); }
         })(); });
       });
 
     return () => { cancelled = true; unsubscribe(); };
-  }, []);
+  }, [loadRetry]);
 
   useEffect(() => {
     if (!ready || !firebaseUser) return;
+    if (skipHydrationSave.current) { skipHydrationSave.current = false; return; }
     const sequence = ++saveSequence.current;
     const clientUpdatedAt = Date.now();
     localBackupAvailable.current = writeBackup(firebaseUser.uid, data, clientUpdatedAt, true);
@@ -283,8 +307,8 @@ export default function SplitApp() {
       }, 8000);
       slowSaveTimer.current = slowTimer;
       void setDoc(doc(db,"users",firebaseUser.uid), { state:data, clientUpdatedAt, updatedAt:serverTimestamp() })
-        .then(() => { if (sequence === saveSequence.current) { writeBackup(firebaseUser.uid, data, clientUpdatedAt, false); setSync("synced"); } })
-        .catch(() => { if (sequence === saveSequence.current) setSync(navigator.onLine ? "error" : "offline"); })
+        .then(() => { if (sequence === saveSequence.current) { writeBackup(firebaseUser.uid, data, clientUpdatedAt, false); setSyncError(""); setSync("synced"); } })
+        .catch((error) => { if (sequence === saveSequence.current) { setSyncError(syncFailure(error)); setSync(navigator.onLine ? "error" : "offline"); } })
         .finally(() => clearTimeout(slowTimer));
     }, 550);
     return () => {
@@ -314,10 +338,16 @@ export default function SplitApp() {
   }
 
   async function signOutAndClear() {
-    if (firebaseUser) localStorage.removeItem(backupKey(firebaseUser.uid));
+    if (firebaseUser && !readBackup(firebaseUser.uid)?.pending) localStorage.removeItem(backupKey(firebaseUser.uid));
     await signOut(auth);
   }
 
+  function retrySync() {
+    if (firebaseUser && readBackup(firebaseUser.uid)?.pending) setSaveRetry(value => value + 1);
+    else setLoadRetry(value => value + 1);
+  }
+
+  if (loadError && firebaseUser && !ready) return <main className="auth-page"><section className="auth-card"><h1>Couldn’t load your records</h1><p>{syncError}. Your existing cloud records haven’t been changed.</p><button onClick={() => setLoadRetry(value => value + 1)} className="google-sign-in">Retry loading</button></section></main>;
   if (!authReady || (firebaseUser && !ready)) return <main className="auth-page"><div className="auth-card auth-loading"><img src="/split-icon-v2.svg" alt="" width={56} height={56}/><p>Loading Split…</p></div></main>;
   if (!firebaseUser) return <main className="auth-page"><section className="auth-card"><img src="/split-icon-v2.svg" alt="" width={68} height={68}/><span className="eyebrow">Shared expenses, simplified</span><h1>Welcome to Split</h1><p>Keep your groups, expenses and settlements securely synced across your devices.</p><button onClick={() => void signIn()} className="google-sign-in"><LogIn size={18}/>Continue with Google</button><small>Your records stay private to your signed-in account.</small></section></main>;
 
@@ -387,14 +417,14 @@ export default function SplitApp() {
   }
 
   const canSave = formFriends.length >= 1 && Boolean(draft.name.trim()) && Number(draft.price) > 0 && Boolean(currency) && Boolean(draft.payerId) && split.valid;
-  const syncLabel = sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : sync === "delayed" ? "Saved on device · Tap to retry sync" : sync === "offline" ? "Saved on device · Will sync online" : "Save failed · Tap to retry";
+  const syncLabel = sync === "saving" ? "Saving…" : sync === "synced" ? "Synced" : sync === "delayed" ? "Saved on device · Tap to retry sync" : sync === "offline" ? "Saved on device · Will sync online" : syncError || "Save failed · Tap to retry";
   const syncClass = sync === "synced" ? "text-[#178250]" : sync === "saving" ? "text-[#1769e0]" : "text-[#b54708]";
   const syncDot = sync === "synced" ? "bg-[#16a05d]" : sync === "saving" ? "animate-pulse bg-[#1769e0]" : "bg-[#f79009]";
   const canRetrySync = sync === "delayed" || sync === "error";
   return <main className="min-h-screen bg-[#f7f8fa] text-[#172033]">
     <header className="sticky top-0 z-30 border-b border-[#e5e8ee] bg-white/95 backdrop-blur"><div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between px-4 py-3 sm:flex-nowrap sm:px-6">
       <div className="order-1 flex items-center gap-2.5"><img src="/split-icon-v2.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0"/><span className="text-lg font-bold tracking-[-.03em]">Split</span></div>
-      {canRetrySync ? <button type="button" onClick={() => setSaveRetry((value) => value + 1)} className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</button> : <span className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</span>}
+      {canRetrySync ? <button type="button" onClick={retrySync} className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</button> : <span className={`order-3 mt-2 flex w-full items-center justify-end gap-1.5 text-xs font-medium sm:order-2 sm:ml-auto sm:mt-0 sm:w-auto ${syncClass}`}><span className={`h-2 w-2 rounded-full ${syncDot}`}/>{syncLabel}</span>}
       <div className="order-2 flex items-center gap-2 sm:order-3 sm:ml-2">{authReady && (firebaseUser ? <button onClick={() => void signOutAndClear()} className="secondary-button" title={firebaseUser.email ?? "Signed in"}><LogOut size={16}/>Sign out</button> : <button onClick={() => void signIn()} className="secondary-button"><LogIn size={16}/>Sign in</button>)}<button onClick={exportPdf} disabled={exporting || !group.expenses.length || Boolean(dataIssue) || Boolean(group.settleInPrimary && !conversionReady)} className="secondary-button"><Download size={16}/>{exporting ? "Preparing…" : "Export PDF"}</button></div>
     </div></header>
     <div className="mx-auto max-w-6xl px-4 pb-24 pt-5 sm:px-6 sm:pt-8">
